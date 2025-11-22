@@ -32,6 +32,7 @@ current_brightness = 100
 target_brightness = 100
 notifications_enabled = True
 face_detected = False
+is_flashing = False  # Флаг для блокировки других команд во время мигания
 
 # --- Загрузка модели для распознавания лиц ---
 faceProto = "opencv_face_detector.pbtxt"
@@ -86,6 +87,10 @@ def disconnect_from_esp():
     
 
 def send_command(data):
+    global is_flashing
+    if is_flashing and "flash_snake" not in data:
+        return  # Блокируем другие команды во время мигания
+    
     try:
         requests.post(url + "/command", headers=headers, data=json.dumps(data), timeout=1)
     except:
@@ -107,8 +112,12 @@ def get_dominant_color(image, resize_factor=0.2):
 
 # --- Поток анализа цвета с экрана ---
 def screen_color_analyzer(stop_event):
-    global current_color
+    global current_color, is_flashing
     while not stop_event.is_set():
+        if is_flashing:
+            time.sleep(0.1)
+            continue
+            
         try:
             screenshot = ImageGrab.grab()
             target = get_dominant_color(screenshot)
@@ -118,7 +127,7 @@ def screen_color_analyzer(stop_event):
             b_step = (target[2] - current_color[2]) / transition_steps
 
             for _ in range(transition_steps):
-                if stop_event.is_set():
+                if stop_event.is_set() or is_flashing:
                     break
                 current_color[0] += r_step
                 current_color[1] += g_step
@@ -131,8 +140,13 @@ def screen_color_analyzer(stop_event):
 # --- Основной поток управления ---
 def smooth_transition():
     global current_brightness, target_brightness
-    global current_color, target_color, face_detected, screen_mode_active
+    global current_color, target_color, face_detected, screen_mode_active, is_flashing
+    
     while running:
+        if is_flashing:
+            time.sleep(0.05)
+            continue
+            
         if not face_detected:
             # Лампа выключена
             if current_color != [0, 0, 0] or current_brightness != 0:
@@ -155,9 +169,6 @@ def smooth_transition():
                         current_color[i] += step
 
                 send_command({"globalColor": current_color, "brightness": current_brightness})
-            else:
-                # В режиме "цвет с экрана" управление идет потоковым анализом
-                pass
         time.sleep(0.01)
 
 # --- Мониторинг лиц в кадре ---
@@ -171,7 +182,6 @@ def face_detection_loop():
             continue
         frame_with_faces, faceBoxes = highlightFace(faceNet, frame)
         face_detected = bool(faceBoxes)
-        # Можно дополнительно реагировать на появление лица
         time.sleep(0.1)
 
 # --- Мониторинг журнала Windows Event Log ---
@@ -184,7 +194,7 @@ def monitor_event_log():
         flags = win32evtlog.EVENTLOG_BACKWARDS_READ | win32evtlog.EVENTLOG_SEQUENTIAL_READ
         last_total_events = win32evtlog.GetNumberOfEventLogRecords(hand)
         print("Начинаю отслеживание событий. Ждите новых уведомлений...")
-        while True:
+        while running:
             events = win32evtlog.ReadEventLog(hand, flags, 0)
             new_total = win32evtlog.GetNumberOfEventLogRecords(hand)
             if new_total > last_total_events:
@@ -195,21 +205,41 @@ def monitor_event_log():
                 for event in new_events:
                     print(f"ID={event.EventID}, Source={event.SourceName}, Time={event.TimeGenerated}")
                     if notifications_enabled:
-                        # Исправляем вызов flash_color
-                        threading.Thread(target=flash_color, args=([0, 255, 0], 3, 0.3), daemon=True).start()
+                        flash_color([0, 255, 0], 2, 2)
+                        
                 last_total_events = new_total
-            else:
-                print("Нет новых событий.")
             time.sleep(5)
     except Exception as e:
         print(f"Ошибка при мониторинге журнала: {e}")
+
+# --- Функция мигания лампой ---
+def flash_color(color, flashes=3, flash_delay=1):
+    global is_flashing
+    
+    if is_flashing:  # Если уже мигает, не запускаем новое мигание
+        return
+
+    is_flashing = True
+    
+    try:
+        for i in range(flashes):
+  
+            if not running:
+                break
+            # Включаем цвет
+            #print("color",color)
+            send_command({"flash_snake": color})
+            time.sleep(flash_delay)
+            
+    finally:
+        is_flashing = False
+        send_command({"globalColor": current_color, "brightness": current_brightness})
 
 # --- Управление цветом и интерфейс ---
 def choose_color():
     global target_color, current_color
     color_code = colorchooser.askcolor(title="Выберите цвет")
     if color_code and color_code[0]:
-        # Проверяем, что цвет — это список из 3 элементов
         if isinstance(color_code[0], (list, tuple)) and len(color_code[0]) == 3:
             target_color = list(map(int, color_code[0]))
             current_color[:] = target_color
@@ -217,14 +247,12 @@ def choose_color():
         else:
             messagebox.showerror("Ошибка", "Некорректный выбранный цвет")
     else:
-        # Пользователь отменил выбор — ничего не делаем
         pass
 
 def toggle_screen_color_mode():
     global screen_color_mode, screen_mode_active, screen_mode_stop_event, screen_mode_thread
     screen_color_mode = not screen_color_mode
     if screen_color_mode:
-        # запуск анализа цвета
         screen_mode_active = True
         screen_mode_stop_event.clear()
         screen_mode_thread = threading.Thread(target=screen_color_analyzer, args=(screen_mode_stop_event,), daemon=True)
@@ -232,7 +260,6 @@ def toggle_screen_color_mode():
         if screen_button:
             screen_button.config(text="Цвет с экрана: ВКЛ")
     else:
-        # остановка анализа цвета
         screen_mode_active = False
         if screen_mode_stop_event:
             screen_mode_stop_event.set()
@@ -256,11 +283,10 @@ def schedule_reminder():
             messagebox.showerror("Ошибка", "Некорректное время или данные")
            
     def wait_and_trigger(rem_time, task, color):
-        while True:
+        while running:
             now = time.localtime()
             if (now.tm_hour == rem_time.tm_hour) and (now.tm_min == rem_time.tm_min):
-                # Исправляем вызов flash_color
-                threading.Thread(target=flash_color, args=(color, 5, 0.3), daemon=True).start()
+                threading.Thread(target=flash_color, args=(color, 2, 2), daemon=True).start()
                 messagebox.showinfo("Напоминание", task)
                 break
             time.sleep(30)
@@ -287,23 +313,6 @@ def on_closing():
     disconnect_from_esp()
     root.destroy()
     exit()
-
-# --- Функция мигания лампой ---
-def flash_color(color, flashes=3, flash_delay=1):
-    global current_color
-    if not isinstance(color, list) or len(color) != 3:
-        print("Ошибка: color должен быть списком из трех элементов.")
-        return
-    try:
-        original_color = current_color.copy()
-    except:
-        original_color = [0, 0, 0]
-    for _ in range(flashes):
-        send_command({"globalColor": color})
-        time.sleep(flash_delay)
-        send_command({"globalColor": [0, 0, 0]})
-        time.sleep(flash_delay)
-    send_command({"globalColor": original_color})
 
 # --- Запуск ---
 if __name__ == "__main__":
